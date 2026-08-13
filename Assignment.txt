@@ -1,0 +1,199 @@
+Design
++++++++
+                +----------------------+
+                |   Client / API       |
+                +----------+-----------+
+                           |
+                           v
+                +----------------------+
+                | Consistent Hash Ring  |
+                +----------+-----------+
+                           |
+          +----------------+----------------+
+          |                |                |
+          v                v                v
+     +---------+      +---------+      +---------+
+     | Node A  |      | Node B  |      | Node C  |
+     | KV Store|      | KV Store|      | KV Store|
+     +---------+      +---------+      +---------+
+
+#include <algorithm>
+#include <cstdint>
+#include <iostream>
+#include <map>
+#include <mutex>
+#include <optional>
+#include <stdexcept>
+#include <string>
+#include <unordered_map>
+#include <vector>
+
+using NodeId = std::string;
+using Key = std::string;
+using Value = std::string;
+
+class KVNode {
+public:
+    explicit KVNode(NodeId id) : id_(std::move(id)) {}
+
+    void put(const Key& key, const Value& value) {
+        std::lock_guard<std::mutex> lock(mutex_);
+        data_[key] = value;
+    }
+
+    std::optional<Value> get(const Key& key) const {
+        std::lock_guard<std::mutex> lock(mutex_);
+
+        auto it = data_.find(key);
+        if (it == data_.end())
+            return std::nullopt;
+
+        return it->second;
+    }
+
+    bool erase(const Key& key) {
+        std::lock_guard<std::mutex> lock(mutex_);
+        return data_.erase(key) > 0;
+    }
+
+    const NodeId& id() const {
+        return id_;
+    }
+
+    size_t size() const {
+        std::lock_guard<std::mutex> lock(mutex_);
+        return data_.size();
+    }
+
+private:
+    NodeId id_;
+    mutable std::mutex mutex_;
+    std::unordered_map<Key, Value> data_;
+};
+
+
+Using multiple virtual nodes per physical node significantly improves distribution
+
+Implementation
+
+class ConsistentHashRing {
+public:
+    explicit ConsistentHashRing(size_t virtualNodes = 100)
+        : virtualNodes_(virtualNodes) {}
+
+    void addNode(const std::shared_ptr<KVNode>& node) {
+        const auto& nodeId = node->id();
+
+        nodes_[nodeId] = node;
+
+        for (size_t i = 0; i < virtualNodes_; ++i) {
+            uint64_t hash = hashString(nodeId + "#" + std::to_string(i));
+            ring_[hash] = nodeId;
+        }
+    }
+
+    void removeNode(const NodeId& nodeId) {
+        for (size_t i = 0; i < virtualNodes_; ++i) {
+            uint64_t hash = hashString(nodeId + "#" + std::to_string(i));
+            ring_.erase(hash);
+        }
+
+        nodes_.erase(nodeId);
+    }
+
+    std::shared_ptr<KVNode> getNode(const Key& key) const {
+        if (ring_.empty())
+            throw std::runtime_error("No nodes available");
+
+        uint64_t hash = hashString(key);
+
+        auto it = ring_.lower_bound(hash);
+
+        // Wrap around the ring.
+        if (it == ring_.end())
+            it = ring_.begin();
+
+        return nodes_.at(it->second);
+    }
+
+private:
+    static uint64_t hashString(const std::string& value) {
+        // FNV-1a 64-bit hash.
+        uint64_t hash = 14695981039346656037ULL;
+
+        for (unsigned char c : value) {
+            hash ^= c;
+            hash *= 1099511628211ULL;
+        }
+
+        return hash;
+    }
+
+private:
+    size_t virtualNodes_;
+
+    // hash position -> physical node ID
+    std::map<uint64_t, NodeId> ring_;
+
+    // node ID -> node
+    std::unordered_map<NodeId, std::shared_ptr<KVNode>> nodes_;
+};
+
+
+by Distributed KV store
+++++++++++++++++++++++++++
+class DistributedKVStore {
+public:
+    explicit DistributedKVStore(size_t virtualNodes = 100)
+        : ring_(virtualNodes) {}
+
+    void addNode(const std::shared_ptr<KVNode>& node) {
+        ring_.addNode(node);
+    }
+
+    void put(const Key& key, const Value& value) {
+        auto node = ring_.getNode(key);
+        node->put(key, value);
+    }
+
+    std::optional<Value> get(const Key& key) const {
+        auto node = ring_.getNode(key);
+        return node->get(key);
+    }
+
+    bool remove(const Key& key) {
+        auto node = ring_.getNode(key);
+        return node->erase(key);
+    }
+
+private:
+    ConsistentHashRing ring_;
+};
+
+int main() {
+    DistributedKVStore store(200);
+
+    auto nodeA = std::make_shared<KVNode>("Node-A");
+    auto nodeB = std::make_shared<KVNode>("Node-B");
+    auto nodeC = std::make_shared<KVNode>("Node-C");
+
+    store.addNode(nodeA);
+    store.addNode(nodeB);
+    store.addNode(nodeC);
+
+    store.put("user:1001", "Raman");
+    store.put("user:1002", "John");
+    store.put("user:1003", "Alice");
+    store.put("user:1004", "Bob");
+
+    auto value = store.get("user:1001");
+
+    if (value) {
+        std::cout << *value << '\n';
+    }
+
+    std::cout << "Node A: " << nodeA->size() << '\n';
+    std::cout << "Node B: " << nodeB->size() << '\n';
+    std::cout << "Node C: " << nodeC->size() << '\n';
+}
+
